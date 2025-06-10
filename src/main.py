@@ -1,8 +1,10 @@
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
-import httpx
+from typing import Optional, List, Dict
+import asyncio
+from llm_integration import LLMIntegration
+from mcp_integration import MCPIntegration, MCPToolResponse
 
 app = FastAPI(title="DeepSearch MCP LLM API")
 
@@ -11,9 +13,15 @@ class SearchRequest(BaseModel):
     depth: Optional[int] = 1
     breadth: Optional[int] = 3
     llm_provider: Optional[str] = "openai"
-    mcp_tools: Optional[list] = ["web_search", "content_extractor"]
+    mcp_tools: Optional[List[str]] = ["web_search", "content_extractor"]
 
-@app.post("/search")
+class SearchResult(BaseModel):
+    content: str
+    sources: List[Dict]
+    follow_ups: List[str]
+    depth: int
+
+@app.post("/search", response_model=SearchResult)
 async def deep_search(request: SearchRequest):
     """
     Main endpoint for deep search requests
@@ -32,46 +40,73 @@ async def deep_search(request: SearchRequest):
             mcp=mcp
         )
         
-        return {"status": "success", "data": results}
+        return results
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await mcp.close()
 
-async def process_search(query: str, depth: int, breadth: int, llm, mcp):
+async def process_search(
+    query: str, 
+    depth: int, 
+    breadth: int, 
+    llm: LLMIntegration, 
+    mcp: MCPIntegration
+) -> SearchResult:
     """
-    Core search processing logic
+    Core search processing logic with iterative deepening
     """
-    # TODO: Implement iterative search logic
-    pass
-
-class LLMIntegration:
-    """
-    Handles integration with various LLM providers
-    """
-    def __init__(self, provider: str = "openai"):
-        self.provider = provider
+    all_content = []
+    all_sources = []
+    follow_ups = []
     
-    async def generate_queries(self, prompt: str) -> list:
-        """Generate search queries from LLM"""
-        pass
+    # Generate initial queries
+    queries = await llm.generate_queries(query, n=breadth)
     
-    async def analyze_results(self, content: str) -> dict:
-        """Analyze search results with LLM"""
-        pass
-
-class MCPIntegration:
-    """
-    Handles integration with MCP tools
-    """
-    def __init__(self, tools: list):
-        self.tools = tools
+    # Process initial search results
+    search_tasks = [mcp.web_search(q) for q in queries]
+    search_results = await asyncio.gather(*search_tasks)
     
-    async def web_search(self, query: str) -> dict:
-        """Perform web search using MCP tools"""
-        pass
+    # Extract and analyze content
+    for result in search_results:
+        all_sources.extend(result.sources)
+        
+        # Get content from top results
+        content_tasks = [mcp.extract_content(src["url"]) for src in result.sources[:3]]
+        contents = await asyncio.gather(*content_tasks)
+        
+        for content in contents:
+            all_content.append(content.content)
+            analysis = await llm.analyze_results(content.content, query)
+            follow_ups.extend(analysis["follow_ups"])
     
-    async def extract_content(self, url: str) -> str:
-        """Extract content from URLs using MCP tools"""
-        pass
+    # Process follow-up questions if depth > 1
+    if depth > 1 and follow_ups:
+        follow_up_results = await asyncio.gather(
+            *[process_search(
+                q, 
+                depth-1, 
+                breadth, 
+                llm, 
+                mcp
+              ) for q in follow_ups[:breadth]]
+        )
+        
+        for result in follow_up_results:
+            all_content.append(result.content)
+            all_sources.extend(result.sources)
+            follow_ups.extend(result.follow_ups)
+    
+    # Generate final summary
+    final_content = "\n\n".join(all_content)
+    summary = await llm.analyze_results(final_content, query)
+    
+    return SearchResult(
+        content=summary["analysis"],
+        sources=all_sources,
+        follow_ups=follow_ups,
+        depth=depth
+    )
 
 if __name__ == "__main__":
     import uvicorn
